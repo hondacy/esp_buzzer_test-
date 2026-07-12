@@ -19,7 +19,9 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_rom_sys.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
 #include "freertos/FreeRTOS.h"
@@ -40,6 +42,12 @@ constexpr const char *TAG = "esp_buzzer";
 // so keep the DRV8833 input from externally pulling it during reset.
 constexpr gpio_num_t BUZZER_IN1_GPIO = GPIO_NUM_2;
 constexpr gpio_num_t BUZZER_IN2_GPIO = GPIO_NUM_3;
+
+// Three logic outputs for an external 3-phase HDD spindle motor driver.
+// Do not connect a 3-wire HDD motor directly to ESP GPIOs.
+constexpr gpio_num_t MOTOR_PHASE_U_GPIO = GPIO_NUM_4;
+constexpr gpio_num_t MOTOR_PHASE_V_GPIO = GPIO_NUM_5;
+constexpr gpio_num_t MOTOR_PHASE_W_GPIO = GPIO_NUM_6;
 
 constexpr const char *HOSTNAME = "esp-buzzer";
 constexpr const char *AP_SSID = "esp-buzzer-setup";
@@ -67,6 +75,10 @@ constexpr uint32_t COMMAND_POLL_MS = 20;
 constexpr uint32_t INTER_STEP_GAP_MS = 8;
 constexpr size_t MAX_WIFI_SSID_CHARS = 32;
 constexpr size_t MAX_WIFI_PASSWORD_CHARS = 64;
+constexpr uint32_t MOTOR_MIN_STEP_HZ = 5;
+constexpr uint32_t MOTOR_MAX_STEP_HZ = 1200;
+constexpr uint32_t MOTOR_RAMP_MS = 700;
+constexpr uint32_t MOTOR_BUSY_DELAY_MAX_US = 5000;
 
 constexpr const char *DEFAULT_SEQUENCE = "C5,120 rest,80 D5,120 rest,80 E5,180 rest,120 D5,140 C5,220";
 
@@ -84,6 +96,17 @@ struct PlayerCommand {
     PlayerCommandType type;
 };
 
+enum class OutputTarget : uint8_t {
+    Buzzer,
+    Motor,
+};
+
+enum class PhaseDrive : uint8_t {
+    Low,
+    High,
+    Floating,
+};
+
 SemaphoreHandle_t g_state_mutex = nullptr;
 SemaphoreHandle_t g_wifi_mutex = nullptr;
 EventGroupHandle_t g_wifi_events = nullptr;
@@ -92,6 +115,7 @@ httpd_handle_t g_httpd = nullptr;
 
 std::string g_sequence_text = DEFAULT_SEQUENCE;
 std::vector<Step> g_sequence_steps;
+OutputTarget g_output_target = OutputTarget::Buzzer;
 std::string g_saved_ssid;
 std::string g_saved_password;
 std::string g_current_ssid;
@@ -342,6 +366,8 @@ std::string json_escape(const std::string &s)
     return out;
 }
 
+bool wait_for_player_command(uint32_t duration_ms, PlayerCommand *command);
+
 bool nvs_get_string(nvs_handle_t nvs, const char *key, std::string *value, size_t max_chars)
 {
     size_t len = 0;
@@ -458,6 +484,111 @@ bool buzzer_start_tone(uint32_t freq_hz)
     return true;
 }
 
+void motor_set_phase(gpio_num_t gpio, PhaseDrive drive)
+{
+    if (drive == PhaseDrive::Floating) {
+        gpio_set_direction(gpio, GPIO_MODE_INPUT);
+        gpio_set_pull_mode(gpio, GPIO_FLOATING);
+        return;
+    }
+
+    gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
+    gpio_set_level(gpio, drive == PhaseDrive::High ? 1 : 0);
+}
+
+void motor_coast()
+{
+    motor_set_phase(MOTOR_PHASE_U_GPIO, PhaseDrive::Floating);
+    motor_set_phase(MOTOR_PHASE_V_GPIO, PhaseDrive::Floating);
+    motor_set_phase(MOTOR_PHASE_W_GPIO, PhaseDrive::Floating);
+}
+
+void motor_apply_state(uint32_t state)
+{
+    switch (state % 6) {
+    case 0:
+        motor_set_phase(MOTOR_PHASE_U_GPIO, PhaseDrive::High);
+        motor_set_phase(MOTOR_PHASE_V_GPIO, PhaseDrive::Low);
+        motor_set_phase(MOTOR_PHASE_W_GPIO, PhaseDrive::Floating);
+        break;
+    case 1:
+        motor_set_phase(MOTOR_PHASE_U_GPIO, PhaseDrive::High);
+        motor_set_phase(MOTOR_PHASE_V_GPIO, PhaseDrive::Floating);
+        motor_set_phase(MOTOR_PHASE_W_GPIO, PhaseDrive::Low);
+        break;
+    case 2:
+        motor_set_phase(MOTOR_PHASE_U_GPIO, PhaseDrive::Floating);
+        motor_set_phase(MOTOR_PHASE_V_GPIO, PhaseDrive::High);
+        motor_set_phase(MOTOR_PHASE_W_GPIO, PhaseDrive::Low);
+        break;
+    case 3:
+        motor_set_phase(MOTOR_PHASE_U_GPIO, PhaseDrive::Low);
+        motor_set_phase(MOTOR_PHASE_V_GPIO, PhaseDrive::High);
+        motor_set_phase(MOTOR_PHASE_W_GPIO, PhaseDrive::Floating);
+        break;
+    case 4:
+        motor_set_phase(MOTOR_PHASE_U_GPIO, PhaseDrive::Low);
+        motor_set_phase(MOTOR_PHASE_V_GPIO, PhaseDrive::Floating);
+        motor_set_phase(MOTOR_PHASE_W_GPIO, PhaseDrive::High);
+        break;
+    default:
+        motor_set_phase(MOTOR_PHASE_U_GPIO, PhaseDrive::Floating);
+        motor_set_phase(MOTOR_PHASE_V_GPIO, PhaseDrive::Low);
+        motor_set_phase(MOTOR_PHASE_W_GPIO, PhaseDrive::High);
+        break;
+    }
+}
+
+void motor_delay_us(uint32_t delay_us)
+{
+    if (delay_us > MOTOR_BUSY_DELAY_MAX_US) {
+        vTaskDelay(pdMS_TO_TICKS(std::max<uint32_t>(1, delay_us / 1000)));
+    } else {
+        esp_rom_delay_us(delay_us);
+    }
+}
+
+bool motor_run_step_rate(uint32_t step_hz, uint32_t duration_ms, PlayerCommand *command)
+{
+    if (step_hz == 0) {
+        motor_coast();
+        return wait_for_player_command(duration_ms, command);
+    }
+
+    step_hz = std::min(std::max(step_hz, MOTOR_MIN_STEP_HZ), MOTOR_MAX_STEP_HZ);
+
+    int64_t start_us = esp_timer_get_time();
+    int64_t duration_us = static_cast<int64_t>(duration_ms) * 1000;
+    int64_t ramp_us = std::min<int64_t>(duration_us, static_cast<int64_t>(MOTOR_RAMP_MS) * 1000);
+    uint32_t state = 0;
+
+    while (esp_timer_get_time() - start_us < duration_us) {
+        if (xQueueReceive(g_player_queue, command, 0) == pdTRUE) {
+            motor_coast();
+            return true;
+        }
+
+        int64_t elapsed_us = esp_timer_get_time() - start_us;
+        uint32_t drive_hz = step_hz;
+        if (ramp_us > 0 && step_hz > MOTOR_MIN_STEP_HZ && elapsed_us < ramp_us) {
+            drive_hz = MOTOR_MIN_STEP_HZ +
+                       static_cast<uint32_t>((static_cast<uint64_t>(step_hz - MOTOR_MIN_STEP_HZ) * elapsed_us) /
+                                             ramp_us);
+            drive_hz = std::max<uint32_t>(MOTOR_MIN_STEP_HZ, drive_hz);
+        }
+
+        motor_apply_state(state++);
+
+        uint32_t period_us = std::max<uint32_t>(500, 1000000UL / drive_hz);
+        int64_t remaining_us = duration_us - (esp_timer_get_time() - start_us);
+        if (remaining_us <= 0) break;
+        motor_delay_us(static_cast<uint32_t>(std::min<int64_t>(period_us, remaining_us)));
+    }
+
+    motor_coast();
+    return false;
+}
+
 void set_playing(bool playing)
 {
     SemaphoreGuard lock(g_state_mutex);
@@ -486,14 +617,17 @@ void player_task(void *)
         while (true) {
             if (command.type == PlayerCommandType::Stop) {
                 buzzer_stop();
+                motor_coast();
                 set_playing(false);
                 break;
             }
 
             std::vector<Step> steps;
+            OutputTarget target = OutputTarget::Buzzer;
             {
                 SemaphoreGuard lock(g_state_mutex);
                 steps = g_sequence_steps;
+                target = g_output_target;
                 g_playing = true;
             }
 
@@ -501,18 +635,27 @@ void player_task(void *)
             PlayerCommand next_command = {};
 
             for (size_t i = 0; i < steps.size(); ++i) {
-                if (steps[i].freq_hz == 0) {
+                if (target == OutputTarget::Motor) {
                     buzzer_stop();
+                    if (motor_run_step_rate(steps[i].freq_hz, steps[i].duration_ms, &next_command)) {
+                        interrupted = true;
+                        break;
+                    }
                 } else {
-                    buzzer_start_tone(steps[i].freq_hz);
-                }
+                    motor_coast();
+                    if (steps[i].freq_hz == 0) {
+                        buzzer_stop();
+                    } else {
+                        buzzer_start_tone(steps[i].freq_hz);
+                    }
 
-                if (wait_for_player_command(steps[i].duration_ms, &next_command)) {
-                    interrupted = true;
-                    break;
-                }
+                    if (wait_for_player_command(steps[i].duration_ms, &next_command)) {
+                        interrupted = true;
+                        break;
+                    }
 
-                buzzer_stop();
+                    buzzer_stop();
+                }
 
                 if (i + 1 < steps.size() && wait_for_player_command(INTER_STEP_GAP_MS, &next_command)) {
                     interrupted = true;
@@ -521,6 +664,7 @@ void player_task(void *)
             }
 
             buzzer_stop();
+            motor_coast();
             set_playing(false);
 
             if (!interrupted) break;
@@ -862,6 +1006,12 @@ label{display:grid;gap:8px;font-weight:700;margin-top:10px}textarea,input,select
 </section>
 <section class="panel">
 <h2>Sound</h2>
+<label>Output
+<select id="target">
+<option value="buzzer">Buzzer / DRV8833</option>
+<option value="motor">HDD motor / 3 phase</option>
+</select>
+</label>
 <label>Sequence
 <textarea id="sequence" spellcheck="false" placeholder="880,120 0,80 988,120"></textarea>
 </label>
@@ -883,13 +1033,14 @@ async function api(path,options){
 async function refresh(){
   const state=await api('/api/state');
   $('sequence').value=state.sequence;
+  $('target').value=state.output_target;
   $('status').textContent=state.playing?'Playing':'Ready';
   $('wifiStatus').textContent=state.wifi_connected?'Connected to '+state.current_ssid:'Setup AP active: '+state.ap_ssid;
   $('wifiHint').textContent=state.wifi_connected?'Open http://'+state.hostname+'.local on this WiFi network':'Join '+state.ap_ssid+' and open http://192.168.4.1 or http://'+state.hostname+'.local';
 }
 async function play(){
   $('status').textContent='Playing';
-  const body=new URLSearchParams({sequence:$('sequence').value});
+  const body=new URLSearchParams({target:$('target').value,sequence:$('sequence').value});
   try{await api('/api/play',{method:'POST',body});await refresh();}
   catch(e){$('status').textContent=e.message;}
 }
@@ -933,12 +1084,14 @@ esp_err_t state_handler(httpd_req_t *req)
 {
     std::string sequence;
     std::string current_ssid;
+    OutputTarget output_target = OutputTarget::Buzzer;
     bool playing = false;
     bool sta_connected = false;
     bool setup_ap_active = false;
     {
         SemaphoreGuard lock(g_state_mutex);
         sequence = g_sequence_text;
+        output_target = g_output_target;
         playing = g_playing;
         current_ssid = g_current_ssid;
         sta_connected = g_sta_connected;
@@ -949,6 +1102,8 @@ esp_err_t state_handler(httpd_req_t *req)
     body += playing ? "true" : "false";
     body += ",\"sequence\":\"";
     body += json_escape(sequence);
+    body += "\",\"output_target\":\"";
+    body += output_target == OutputTarget::Motor ? "motor" : "buzzer";
     body += "\",\"wifi_connected\":";
     body += sta_connected ? "true" : "false";
     body += ",\"setup_ap_active\":";
@@ -969,6 +1124,7 @@ esp_err_t play_handler(httpd_req_t *req)
 {
     std::string body = read_req_body(req);
     std::string sequence = form_value(body, "sequence");
+    std::string target_text = lower_copy(trim_copy(form_value(body, "target")));
     if (sequence.empty() && body.find('=') == std::string::npos) sequence = url_decode(body);
 
     std::vector<Step> steps;
@@ -982,6 +1138,7 @@ esp_err_t play_handler(httpd_req_t *req)
         SemaphoreGuard lock(g_state_mutex);
         g_sequence_text = sequence;
         g_sequence_steps = steps;
+        g_output_target = target_text == "motor" ? OutputTarget::Motor : OutputTarget::Buzzer;
     }
 
     PlayerCommand command = {PlayerCommandType::Play};
@@ -1053,6 +1210,7 @@ void app_main(void)
     }
 
     buzzer_force_idle_gpio();
+    motor_coast();
     xTaskCreate(player_task, "buzzer_player", 4096, nullptr, 5, nullptr);
 
     bool has_saved_wifi = load_wifi_credentials();
